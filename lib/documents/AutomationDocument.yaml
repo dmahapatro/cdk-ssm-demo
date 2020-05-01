@@ -1,0 +1,222 @@
+---
+description: SSM Automation Document for forensic analysis
+schemaVersion: '0.3'
+assumeRole: "{{ AutomationAssumeRole }}"
+
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: "(Requried) The ARN of the role that allows Automation to perform the actions on your behalf."
+  InstanceId:
+    type: String
+    description: "(Required) Instance Id of the EC2 Instance that has been compromised"
+  DisableApiTermination:
+    type: String
+    default: 'false'
+    description: "Do you want to disable API termination"
+    allowedValues:
+    - 'true'
+    - 'false'
+  NotificationTopicARN:
+    type: String
+    description: "The ARN of the SNS topic to publish notifications"
+
+mainSteps:
+- name: getInstanceInformation
+  action: aws:executeAwsApi
+  maxAttempts: 3
+  timeoutSeconds: 3600
+  inputs:
+    Service: ec2
+    Api: DescribeInstances
+    Filters:  
+    - Name: instance-id
+      Values: 
+      - "{{ InstanceId }}"
+  outputs:
+  - Name: InstanceId
+    Selector: "$.Reservations[0].Instances[0].InstanceId"
+    Type: "String"
+  - Name: InstanceVPCId
+    Selector: "$.Reservations[0].Instances[0].VpcId"
+    Type: String
+  - Name: RootDeviceVolumeId
+    Selector: "$.Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId"
+    Type: String
+  - Name: NetworkInterfaceId
+    Selector: "$.Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId"
+    Type: String
+  - Name: SecurityGroupIds
+    Selector: "$.Reservations[0].Instances[0].SecurityGroups..GroupId"
+    Type: StringList
+
+# Protect that instance from accidental termination 
+- name: disableApiTermination
+  action: aws:executeAwsApi
+  inputs:
+    Service: ec2
+    Api: ModifyInstanceAttribute
+    InstanceId: "{{ getInstanceInformation.InstanceId }}"
+    Attribute: disableApiTermination
+    Value: "{{ DisableApiTermination }}"
+
+# Attach restricted Security group to instance
+# - name: updateSecurityGroup
+#   action: aws:executeAwsApi
+#   inputs:
+#     Service: ec2
+#     Api: ModifyNetworkInterfaceAttribute
+#     NetworkInterfaceId: "{{ getInstanceInformation.NetworkInterfaceId }}"
+#     Groups: 
+#     - "{{ SecurityGroupToAttach }}"
+
+# Check if instance is attached to Auto Scaling Group
+- name: checkInstanceAttachedToASG
+  action: aws:executeAwsApi
+  inputs:
+    Service: autoscaling
+    Api: DescribeAutoScalingInstances
+    InstanceIds:
+    - "{{ getInstanceInformation.InstanceId }}"
+  outputs:
+  - Name: InstanceId
+    Selector: "$.AutoScalingInstances[0].InstanceId"
+    Type: String
+  - Name: AutoScalingGroupName
+    Selector: "$.AutoScalingInstances[0].AutoScalingGroupName"
+    Type: String
+
+- name: chooseASGDetachment
+  action: aws:branch
+  inputs:
+    Choices:
+    - NextStep: detachInstanceFromASG
+      Variable: "{{ checkInstanceAttachedToASG.InstanceId }}"
+      StringEquals: "{{ getInstanceInformation.InstanceId }}"
+    Default:
+      createAMIFromInstance
+
+# Detach Instance from ASG
+- name: detachInstanceFromASG
+  action: aws:executeAwsApi
+  inputs:
+    Service: autoscaling
+    Api: DetachInstances
+    AutoScalingGroupName: "{{ checkInstanceAttachedToASG.AutoScalingGroupName }}"
+    ShouldDecrementDesiredCapacity: false
+    InstanceIds:
+    - "{{ getInstanceInformation.InstanceId }}"
+
+## Move system logs to S3 bucket
+# - name: moveSystemLogsToS3Bucket
+#   action: aws:invokeLambdaFunction
+#   maxAttempts: 3
+#   timeoutSeconds: 900
+#   onFailure: Continue
+#   inputs:
+#     FunctionName: "{{ AutomationLambdaForLogs }}"
+#     InvocationType: Event
+#     Payload: "{\"InstanceId\": \"{{ getInstanceInformation.InstanceId }}\", \"LogType\": \"system\", \"S3BucketName\": \"{{ S3BucketNameToStoreArtifacts }}\" }"
+
+## netstat dump to S3 bucket, and 
+## Margarita Shotgun dump to predefined S3 bucket
+
+# Stop compromised EC2 instance
+# - name: stopCompromisedInstance
+#   action: aws:changeInstanceState
+#   maxAttempts: 3
+#   timeoutSeconds: 3600
+#   onFailure: Abort
+#   inputs:
+#     InstanceIds:
+#     - "{{ getInstanceInformation.InstanceId }}"
+#     CheckStateOnly: false
+#     DesiredState: stopped
+
+# Create AMI from the instance. This also creates a snapshot of all attached EBS volumes
+- name: createAMIFromInstance
+  action: aws:createImage
+  maxAttempts: 3
+  onFailure: Abort
+  inputs:
+    InstanceId: "{{ getInstanceInformation.InstanceId }}"
+    ImageName: "CIRT Image Created On {{ global:DATE_TIME }}"
+    ImageDescription: "Forensic AMI created on {{ global:DATE_TIME }} from instance with id {{ getInstanceInformation.InstanceId }}"
+    NoReboot: true
+  outputs:
+  - Name: NewImageId
+    Selector: "$.ImageId"
+    Type: String
+
+# Give IR account acces to the newly created AMI and the underlying EBS volume snapshots
+# - name: shareAMIwithIRTeam
+#   action: aws:executeAwsApi
+#   maxAttempts: 3
+#   onFailure: Abort
+#   inputs:
+#     Service: ec2
+#     Api: ModifyImageAttribute
+#     ImageId: "{{ createAMIFromInstance.NewImageId }}"
+#     LaunchPermission: 
+#       Add:
+#       - UserId: "{{ IRAccountId }}"
+
+# Tag the contaminated instance with the ticket or reference ID 
+- name: createTags
+  action: aws:createTags
+  maxAttempts: 3
+  onFailure: Abort
+  inputs:
+    ResourceType: EC2
+    ResourceIds:
+    - "{{ createAMIFromInstance.NewImageId }}"
+    - "{{ getInstanceInformation.InstanceId }}"
+    Tags:
+    - Key: Environment
+      Value: 'Quarantine:REFERENCE-ID'
+    - Key: Team
+      Value: IncidentResponse
+
+# Attach original Security group to instance. This step is optional.
+# It is better to do it this way so that the cleanup ceremony can happen appropriately
+# - name: updateSecurityGroupToOriginal
+#   action: aws:executeAwsApi
+#   maxAttempts: 3
+#   onFailure: Abort  
+#   inputs:
+#     Service: ec2
+#     Api: ModifyNetworkInterfaceAttribute
+#     NetworkInterfaceId: "{{ getInstanceInformation.NetworkInterfaceId }}"
+#     Groups: "{{ getInstanceInformation.SecurityGroupIds }}"
+
+# Enable Instance API termination
+- name: enableApiTermination
+  action: aws:executeAwsApi
+  inputs:
+    Service: ec2
+    Api: ModifyInstanceAttribute
+    InstanceId: "{{ getInstanceInformation.InstanceId }}"
+    Attribute: disableApiTermination
+    Value: 'false'
+
+# Terminate compromised EC2 instance
+- name: terminateCompromisedInstance
+  action: aws:changeInstanceState
+  maxAttempts: 3
+  timeoutSeconds: 3600
+  onFailure: Abort
+  inputs:
+    InstanceIds:
+    - "{{ getInstanceInformation.InstanceId }}"
+    CheckStateOnly: false
+    DesiredState: terminated
+
+# Wait for the instance to shutdown, and snapshot creating done, and then Send SNS notification to desired group 
+- name: sendPushNotifications
+  action: aws:executeAwsApi
+  inputs:
+    Service: sns
+    Api: Publish
+    Message: "SSM Automation was run successfully"
+    TopicArn: "{{ NotificationTopicARN }}"
+---  
